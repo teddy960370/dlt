@@ -1,0 +1,42 @@
+# 來源實例清單（catalog）
+#
+# 每個 top-level key = 一個來源實例名稱，同時也是：
+#   - .env 連線變數的前綴（大寫），例如 MSSQL1_HOST、ORACLE1_HOST
+#   - CLI --source 的值
+#
+# type:     mssql | oracle      決定驅動與連線字串
+# schema:   來源 schema 名稱
+# tables:   要拋轉的固定資料表清單，每張表標註 mode：
+#   - mode: batch         需要 batch_column；CLI --batch-value 帶入（空則抓該欄位最新值）
+#                         寫入前先 DELETE WHERE batch_column = value，再 append
+#   - mode: full_replace  維度小表；整表清空後全量寫入
+#   - mode: scd2          緩時變維度；需要 scd_natural_key（自然鍵，可多欄）
+#                         dlt merge/scd2，自動維護 _dlt_valid_from / _dlt_valid_to
+#
+# 下面為範例，請由開發人員依實際來源補上：
+
+sources:
+  MSSQL1:
+    type: mssql
+    schema: dbo
+    tables:
+      - name: sales_fact
+        mode: batch
+        batch_column: edition
+      - name: dim_product
+        mode: full_replace
+      - name: dim_customer
+        mode: scd2
+        scd_natural_key: customer_id
+        # 多欄自然鍵寫法：
+        # scd_natural_key:
+        #   - company_id
+        #   - customer_id
+
+  # ORACLE1:
+  #   type: oracle
+  #   schema: APP
+  #   tables:
+  #     - name: ORDER_FACT
+  #       mode: batch
+  #       batch_column: BATCH_NO

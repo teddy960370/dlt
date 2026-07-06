@@ -1,0 +1,22 @@
+# secrets / connection info
+.env
+
+# dlt runtime artifacts
+.dlt/
+*.duckdb
+load/
+schema/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
