@@ -11,6 +11,8 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from el.source import Node, iter_postorder
+
 
 def fetch_latest_batch_value(engine: Engine, schema: str, table: str, column: str) -> Any:
     """Return MAX(column) from the source table — the latest batch value."""
@@ -36,30 +38,57 @@ def _quote_ident(identifier: str) -> str:
     return "`" + identifier.replace("`", "``") + "`"
 
 
-def delete_batch(pipeline, source_table: str, batch_column: str, value: Any) -> bool:
-    """Delete rows of one batch from the ClickHouse target table.
+def delete_batch_tree(pipeline, root: Node, batch_column: str, value: Any) -> dict[str, int]:
+    """Post-order delete a batch parent and all descendant child tables in ClickHouse.
 
-    Resolves the destination's physical table/column names via dlt's naming
-    convention, so it works regardless of dlt's dataset-prefix and casing rules.
+    Each node's rows that belong to this batch are deleted:
+      root  -> WHERE batch_column = value
+      child -> WHERE child_key IN (SELECT parent_key FROM parent_ch WHERE membership(parent))
 
-    Returns True if a DELETE ran, False if the target table does not exist yet
-    (first load — dlt will create it).
+    Children are deleted before parents so ancestor rows are still present to
+    identify which descendant rows to remove. A node whose ClickHouse table does
+    not exist yet (first load) is skipped. Physical table/column names are resolved
+    via dlt's naming convention. Returns {node.path: deleted_count}.
     """
     naming = pipeline.naming
-    norm_table = naming.normalize_table_identifier(source_table)
-    norm_col = naming.normalize_identifier(batch_column)
+    counts: dict[str, int] = {}
 
     with pipeline.sql_client() as client:
-        db_name, phys_table = client.make_qualified_table_name_path(norm_table, quote=False)
-        exists = client.execute_sql(
-            "SELECT count() FROM system.tables "
-            f"WHERE database = {_ch_literal(db_name)} AND name = {_ch_literal(phys_table)}"
-        )
-        if not exists or not exists[0][0]:
-            return False
 
-        qualified = client.make_qualified_table_name(norm_table)
-        client.execute_sql(
-            f"DELETE FROM {qualified} WHERE {_quote_ident(norm_col)} = {_ch_literal(value)}"
-        )
-        return True
+        def qualified(name: str) -> str:
+            return client.make_qualified_table_name(naming.normalize_table_identifier(name))
+
+        def col(name: str) -> str:
+            return _quote_ident(naming.normalize_identifier(name))
+
+        def table_exists(name: str) -> bool:
+            db, phys = client.make_qualified_table_name_path(
+                naming.normalize_table_identifier(name), quote=False
+            )
+            r = client.execute_sql(
+                "SELECT count() FROM system.tables "
+                f"WHERE database = {_ch_literal(db)} AND name = {_ch_literal(phys)}"
+            )
+            return bool(r and r[0][0])
+
+        def membership_ch(node: Node) -> str:
+            if node.parent is None:
+                return f"{col(batch_column)} = {_ch_literal(value)}"
+            return (
+                f"{col(node.child_key)} IN "
+                f"(SELECT {col(node.parent_key)} FROM {qualified(node.parent.table_name)} "
+                f"WHERE {membership_ch(node.parent)})"
+            )
+
+        for node in iter_postorder(root):
+            if not table_exists(node.table_name):
+                counts[node.path] = 0
+                continue
+            where = membership_ch(node)
+            cnt = client.execute_sql(f"SELECT count() FROM {qualified(node.table_name)} WHERE {where}")
+            n = int(cnt[0][0]) if cnt and cnt[0] else 0
+            if n:
+                client.execute_sql(f"DELETE FROM {qualified(node.table_name)} WHERE {where}")
+            counts[node.path] = n
+
+    return counts
