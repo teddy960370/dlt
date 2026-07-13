@@ -1,9 +1,9 @@
 """CLI entry point.
 
 Usage:
-    python -m el.run --source MSSQL1
-    python -m el.run --source MSSQL1 --batch-value 2026Q1
-    python -m el.run --source ORACLE1 --tables ORDER_FACT,dim_customer
+    python -m el.run --source ERP
+    python -m el.run --source ERP --batch-value 2026Q1
+    python -m el.run --source MES --tables ORDER_FACT,dim_customer
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def main() -> None:
     parser.add_argument(
         "--source",
         required=True,
-        help="Source instance name (key in config/sources.yml, e.g. MSSQL1)",
+        help="Source instance name (key in config/sources.yml, e.g. ERP)",
     )
     parser.add_argument(
         "--batch-value",

@@ -4,9 +4,12 @@
 #   - .env 連線變數的前綴（大寫），例如 MSSQL1_HOST、ORACLE1_HOST
 #   - CLI --source 的值
 #
-# type:     mssql | oracle      決定驅動與連線字串
-# schema:   來源 schema 名稱
-# tables:   要拋轉的固定資料表清單，每張表標註 mode：
+# type:          mssql | oracle   決定驅動與連線字串
+# schema:        來源端 schema 名稱（MSSQL/Oracle）
+# target_schema: 目的地 ClickHouse database（schema），每個來源獨立分開，
+#                例如 ERP 來源存到 raw_erp。表會存成 <target_schema>.<table>（無前綴）。
+#                此 database 若不存在，程式會自動 CREATE DATABASE IF NOT EXISTS。
+# tables:        要拋轉的固定資料表清單，每張表標註 mode：
 #   - mode: batch         需要 batch_column；CLI --batch-value 帶入（空則抓該欄位最新值）
 #                         寫入前先 DELETE WHERE batch_column = value，再 append
 #   - mode: full_replace  維度小表；整表清空後全量寫入
@@ -16,27 +19,48 @@
 # 下面為範例，請由開發人員依實際來源補上：
 
 sources:
-  MSSQL1:
+  IMS:
     type: mssql
     schema: dbo
+    target_schema: raw_test
     tables:
-      - name: sales_fact
+      - name: IMS_P_Case
         mode: batch
-        batch_column: edition
-      - name: dim_product
+        batch_column: Edition
+        children:
+          - name: IMS_P_Case_CpDetail
+            child_key: PID          # FK 欄
+            parent_key: ID          # 對應父表的欄
+          - name : IMS_P_Case_Sample
+            child_key: PID 
+            parent_key: ID 
+          - name : IMS_P_Case_Allowance
+            child_key: PID 
+            parent_key: ID 
+
+      - name: IMS_P_Edition
         mode: full_replace
-      - name: dim_customer
-        mode: scd2
-        scd_natural_key: customer_id
+      #- name: dim_customer
+      #  mode: scd2
+      #  scd_natural_key: customer_id
         # 多欄自然鍵寫法：
         # scd_natural_key:
         #   - company_id
         #   - customer_id
 
-  # ORACLE1:
-  #   type: oracle
-  #   schema: APP
-  #   tables:
-  #     - name: ORDER_FACT
-  #       mode: batch
-  #       batch_column: BATCH_NO
+  HUB:
+    type: oracle
+    schema: EDI
+    target_schema: raw_test
+    tables:
+      - name: ZZ_MODEL_INFO
+        mode: full_replace
+        
+  AYEIP_CHILD:
+    type: oracle
+    schema: AYEIP_CHILD
+    target_schema: raw_test
+    tables:
+      - name: BCP0004_HEADER
+        mode: batch
+        batch_column: VERSION

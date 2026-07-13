@@ -42,10 +42,10 @@ dlt/                          # repo 根目錄
 模組職責邊界：
 
 - `settings.py`：唯一讀取 `os.environ` / `.env` 的地方。依「來源實例名稱」當前綴解析來源連線設定，並讀取單一 ClickHouse 設定，輸出 typed 物件（`SourceConfig`、`ClickHouseConfig`）。
-- `connections.py`：把設定物件依 `type` 轉成連線 — 來源用 SQLAlchemy engine／dlt 憑證；ClickHouse 用 clickhouse-connect client 與 dlt clickhouse destination。
+- `connections.py`：把設定物件依 `type` 轉成連線 — 來源用 SQLAlchemy engine；ClickHouse destination 以每來源的 `target_schema` 當 database 建立，並提供 `ensure_clickhouse_database`（CREATE DATABASE IF NOT EXISTS）。
 - `batch.py`：batch value 的解析與 ClickHouse 的刪除/存在檢查，純函式，輸入連線、表名與 batch 欄位。
 - `source.py`：把一張表的設定（schema、table、mode、batch 欄位/值）轉成一個 dlt resource。
-- `pipeline.py`：依來源實例逐表編排「刪除 → 寫入」，不直接碰 .env。
+- `pipeline.py`：依來源實例逐表編排「刪除 → 寫入」，建立目的 database、以空 dataset 建 pipeline，不直接碰 .env。
 - `run.py`：只負責解析 CLI 參數並呼叫 `pipeline`。
 
 ## 3. 拋轉模式
@@ -141,12 +141,28 @@ CLICKHOUSE_SECURE=false
   `oracle+oracledb://USER:PASS@HOST:PORT/?service_name=<SERVICE>`
 - ClickHouse：以環境變數組出 dlt clickhouse destination 憑證；刪除/存在檢查使用 clickhouse-connect client（HTTP）。
 
-### 5.3 sources.yml 格式
+### 5.3 目的地 schema 分離（每來源一個 ClickHouse database）
+每個來源實例在 `sources.yml` 指定 `target_schema`，對應一個獨立的 ClickHouse
+database（如 ERP → `raw_erp`），表存成 `<target_schema>.<table>`。
+
+實作重點（已查證安裝中的 dlt 1.28.1 行為）：
+- dlt ClickHouse 的 `catalog_name = credentials.database`（單一 connect database），
+  `dataset_name` 只是表名前綴（`database.dataset___table`）。
+- ClickHouse configuration 允許**空 dataset**（`needs_dataset_name()` 為 False）；
+  空 dataset 時表直接落在 `credentials.database`，無 `___` 前綴。
+- 因此每個來源以 `credentials.database = target_schema` 建 destination，並將
+  `dataset_name` 設為空字串，得到乾淨的 `raw_erp.<table>`。
+- 目的 database 若不存在，程式連到 bootstrap database（`CLICKHOUSE_DATABASE`，通常
+  `default`）執行 `CREATE DATABASE IF NOT EXISTS <target_schema>`。
+- dlt 系統表（`_dlt_loads`、`_dlt_pipeline_state`…）也落在該 database。
+
+### 5.4 sources.yml 格式
 ```yaml
 sources:
-  MSSQL1:                      # 來源實例名稱（= .env 前綴、= CLI --source 值）
+  ERP:                         # 來源實例名稱（= .env 前綴、= CLI --source 值）
     type: mssql                # mssql | oracle，決定驅動與連線字串
-    schema: dbo
+    schema: dbo                # 來源端 schema
+    target_schema: raw_erp     # 目的地 ClickHouse database（schema）
     tables:
       - name: sales_fact
         mode: batch
@@ -156,9 +172,10 @@ sources:
       - name: dim_customer
         mode: scd2
         scd_natural_key: customer_id   # 自然鍵，可寫成清單支援多欄
-  ORACLE1:
+  MES:
     type: oracle
     schema: APP
+    target_schema: raw_mes
     tables:
       - name: ORDER_FACT
         mode: batch
@@ -188,7 +205,7 @@ sources:
 python -m el.run --source <實例名稱> [--batch-value <值>] [--tables <t1,t2,...>]
 ```
 
-- `--source`（必填）：要拋轉的來源實例名稱，對應 `sources.yml` 的 key（如 `MSSQL1`、`ORACLE1`）。
+- `--source`（必填）：要拋轉的來源實例名稱，對應 `sources.yml` 的 key（如 `ERP`、`MES`）。
 - `--batch-value`（選填）：batch 模式表使用；未帶則各表抓各自 `batch_column` 的最新值。
 - `--tables`（選填）：只跑指定子集；未帶則跑該來源實例清單中所有表，各自依 mode 處理。
 

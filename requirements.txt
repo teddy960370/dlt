@@ -46,7 +46,7 @@ mdurl==0.1.2
 more-itertools==10.8.0
 msgpack==1.1.2
 networkx==3.5
-oracledb==4.0.1
+oracledb==2.5.1           # pinned: 2.x thick mode supports Oracle Client 12.2 (needed for 11g); 4.x requires client 19.1+
 orderly-set==5.5.0
 orjson==3.11.9
 packaging==25.0
