@@ -2,52 +2,38 @@
 from __future__ import annotations
 
 import logging
+from collections import namedtuple
+from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 import dlt
 
 from el.batch import delete_batch_tree, fetch_latest_batch_value
+from el.ch_internal import normalized_table_name, row_counts_for, sync_schema_from_destination
 from el.connections import (
     build_clickhouse_destination,
     build_source_engine,
     ensure_clickhouse_database,
 )
+from el.results import RunResult, TableResult
 from el.settings import load_catalog, load_clickhouse_config, load_source_connection
 from el.source import build_batch_tree, build_child_resource, build_resource, iter_preorder
 
 log = logging.getLogger("el")
 
 
-def _items_count(step_info, normalized_table: str) -> int:
-    """Sum items_count for a normalized table from an extract/normalize StepInfo."""
-    metrics = getattr(step_info, "metrics", None)
-    if not metrics:
-        return 0
-    total = 0
-    for metrics_list in metrics.values():
-        for m in metrics_list:
-            wm = m["table_metrics"].get(normalized_table)
-            if wm is not None:
-                total += wm.items_count
-    return total
+_LoadItem = namedtuple("_LoadItem", "label mode table_name batch_value resource deleted")
 
 
-def _log_load(pipeline, source_name, label, mode, deleted, node_table_name) -> None:
-    """Log select/delete/insert row counts for one loaded node."""
-    norm = pipeline.naming.normalize_table_identifier(node_table_name)
-    trace = pipeline.last_trace
-    selected = _items_count(trace.last_extract_info, norm) if trace else 0
-    inserted = _items_count(trace.last_normalize_info, norm) if trace else 0
-    log.info(
-        "[%s.%s] mode=%s | select=%d delete=%d insert=%d",
-        source_name, label, mode, selected, deleted, inserted,
-    )
+def _collect_batch_items(pipeline, engine, source, table, value) -> list:
+    """Pre-delete (post-order) the batch tree, then return one _LoadItem per node.
 
-
-def _run_batch_tree(pipeline, engine, source, source_name, table, value) -> None:
-    """Pre-delete (post-order) then load (pre-order) a batch parent and its children."""
+    Resources are lazy (reflection happens at extract time), so they are collected
+    here and loaded together in a single pipeline.run() by the caller.
+    """
     root = build_batch_tree(table)
     del_counts = delete_batch_tree(pipeline, root, table.batch_column, value)
+    items: list = []
     for node in iter_preorder(root):
         if node.parent is None:
             resource = build_resource(engine, source, table, value)
@@ -55,16 +41,19 @@ def _run_batch_tree(pipeline, engine, source, source_name, table, value) -> None
         else:
             resource = build_child_resource(engine, source, node, table.batch_column, value)
             mode = "batch-child"
-        pipeline.run(resource)
-        _log_load(pipeline, source_name, node.path, mode, del_counts.get(node.path, 0), node.table_name)
+        items.append(
+            _LoadItem(node.path, mode, node.table_name, str(value), resource, del_counts.get(node.path, 0))
+        )
+    return items
 
 
 def run_source(
     source_name: str,
     batch_value: Optional[str] = None,
     only_tables: Optional[Sequence[str]] = None,
-) -> None:
+) -> RunResult:
     """Run the EL pipeline for one named source instance from sources.yml."""
+    started = datetime.now(timezone.utc)
     catalog = load_catalog()
     if source_name not in catalog:
         raise KeyError(
@@ -86,6 +75,9 @@ def run_source(
         # Empty dataset -> tables stored directly as <target_schema>.<table>, no prefix.
         dataset_name="",
     )
+    # Restore dlt's schema from ClickHouse so the pre-delete drift guard can tell a
+    # first load apart from a naming mismatch (see el/ch_internal.py, el/batch.py).
+    sync_schema_from_destination(pipeline)
     log.info("[%s] target ClickHouse database = %s", source_name, source.target_schema)
 
     tables = list(source.tables)
@@ -96,7 +88,10 @@ def run_source(
         if missing:
             raise KeyError(f"Tables not in source '{source_name}': {', '.join(sorted(missing))}")
 
+    results: list[TableResult] = []
     try:
+        # 1) Pre-delete all batch trees and collect all (lazy) resources to load.
+        items: list = []
         for table in tables:
             if table.mode == "batch":
                 value = batch_value
@@ -108,10 +103,39 @@ def run_source(
                 if value is None:
                     log.warning("[%s.%s] no batch value found; skipping", source_name, table.name)
                     continue
-                _run_batch_tree(pipeline, engine, source, source_name, table, value)
+                items.extend(_collect_batch_items(pipeline, engine, source, table, value))
             else:
                 resource = build_resource(engine, source, table)
-                pipeline.run(resource)
-                _log_load(pipeline, source_name, table.name, table.mode, 0, table.name)
+                items.append(_LoadItem(table.name, table.mode, table.name, None, resource, 0))
+
+        # 2) Load everything in a SINGLE pipeline.run() — one extract->normalize->load
+        #    cycle instead of one per table, to avoid repeated file-move contention
+        #    that triggers Windows WinError 32 during normalize.
+        if items:
+            pipeline.run([it.resource for it in items])
+
+        # 3) Record per-table counts from the run's trace.
+        for it in items:
+            selected, inserted = row_counts_for(pipeline, normalized_table_name(pipeline, it.table_name))
+            log.info(
+                "[%s.%s] mode=%s | select=%d delete=%d insert=%d",
+                source_name, it.label, it.mode, selected, it.deleted, inserted,
+            )
+            results.append(
+                TableResult(
+                    path=it.label, mode=it.mode, select=selected, delete=it.deleted,
+                    insert=inserted, batch_value=it.batch_value,
+                )
+            )
     finally:
         engine.dispose()
+
+    finished = datetime.now(timezone.utc)
+    return RunResult(
+        source=source_name,
+        status="success",
+        started_at=started.isoformat(),
+        finished_at=finished.isoformat(),
+        duration_seconds=(finished - started).total_seconds(),
+        tables=results,
+    )

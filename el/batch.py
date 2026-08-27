@@ -2,15 +2,18 @@
 
 For 'batch' mode tables: before loading a batch, remove any existing rows of the
 same batch value from the ClickHouse target, so re-running a batch replaces it.
+
+All dlt-internal name resolution is delegated to el.ch_internal (the single place
+that touches dlt internals — see the banner there).
 """
 from __future__ import annotations
 
-from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from el.ch_internal import ch_literal, dlt_knows_table, open_ch_namer
 from el.source import Node, iter_postorder
 
 
@@ -22,22 +25,6 @@ def fetch_latest_batch_value(engine: Engine, schema: str, table: str, column: st
         return conn.execute(sql).scalar()
 
 
-def _ch_literal(value: Any) -> str:
-    """Render a Python value as a ClickHouse SQL literal."""
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, (int, float, Decimal)):
-        return str(value)
-    s = str(value).replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{s}'"
-
-
-def _quote_ident(identifier: str) -> str:
-    return "`" + identifier.replace("`", "``") + "`"
-
-
 def delete_batch_tree(pipeline, root: Node, batch_column: str, value: Any) -> dict[str, int]:
     """Post-order delete a batch parent and all descendant child tables in ClickHouse.
 
@@ -46,49 +33,44 @@ def delete_batch_tree(pipeline, root: Node, batch_column: str, value: Any) -> di
       child -> WHERE child_key IN (SELECT parent_key FROM parent_ch WHERE membership(parent))
 
     Children are deleted before parents so ancestor rows are still present to
-    identify which descendant rows to remove. A node whose ClickHouse table does
-    not exist yet (first load) is skipped. Physical table/column names are resolved
-    via dlt's naming convention. Returns {node.path: deleted_count}.
+    identify which descendant rows to remove. Returns {node.path: deleted_count}.
+
+    Drift guard: if a node's physical table is not found but dlt's schema says it
+    should exist, we raise (rather than silently skip) — this is the LOUD failure
+    that catches a dlt naming change on upgrade. See el/ch_internal.py.
     """
-    naming = pipeline.naming
     counts: dict[str, int] = {}
 
-    with pipeline.sql_client() as client:
-
-        def qualified(name: str) -> str:
-            return client.make_qualified_table_name(naming.normalize_table_identifier(name))
-
-        def col(name: str) -> str:
-            return _quote_ident(naming.normalize_identifier(name))
-
-        def table_exists(name: str) -> bool:
-            db, phys = client.make_qualified_table_name_path(
-                naming.normalize_table_identifier(name), quote=False
-            )
-            r = client.execute_sql(
-                "SELECT count() FROM system.tables "
-                f"WHERE database = {_ch_literal(db)} AND name = {_ch_literal(phys)}"
-            )
-            return bool(r and r[0][0])
+    with open_ch_namer(pipeline) as namer:
 
         def membership_ch(node: Node) -> str:
             if node.parent is None:
-                return f"{col(batch_column)} = {_ch_literal(value)}"
+                return f"{namer.column(batch_column)} = {ch_literal(value)}"
             return (
-                f"{col(node.child_key)} IN "
-                f"(SELECT {col(node.parent_key)} FROM {qualified(node.parent.table_name)} "
+                f"{namer.column(node.child_key)} IN "
+                f"(SELECT {namer.column(node.parent_key)} FROM {namer.qualified(node.parent.table_name)} "
                 f"WHERE {membership_ch(node.parent)})"
             )
 
         for node in iter_postorder(root):
-            if not table_exists(node.table_name):
+            if not namer.exists(node.table_name):
+                if dlt_knows_table(pipeline, node.table_name):
+                    db, phys = namer.physical_path(node.table_name)
+                    raise RuntimeError(
+                        f"Pre-delete target for '{node.table_name}' not found in ClickHouse as "
+                        f"'{db}.{phys}', but dlt's schema says this table exists. This usually "
+                        f"means dlt's table-naming changed (upgrade?) and the pre-delete would "
+                        f"silently miss the real table. Re-check el/ch_internal.py against this "
+                        f"dlt version."
+                    )
+                # genuine first load — dlt will create the table on load
                 counts[node.path] = 0
                 continue
+
             where = membership_ch(node)
-            cnt = client.execute_sql(f"SELECT count() FROM {qualified(node.table_name)} WHERE {where}")
-            n = int(cnt[0][0]) if cnt and cnt[0] else 0
+            n = namer.count(node.table_name, where)
             if n:
-                client.execute_sql(f"DELETE FROM {qualified(node.table_name)} WHERE {where}")
+                namer.delete(node.table_name, where)
             counts[node.path] = n
 
     return counts

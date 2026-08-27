@@ -1,0 +1,29 @@
+{
+  // VSCode 除錯設定：啟動 el 的 FastAPI（uvicorn），可直接下中斷點
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "FastAPI: el API (debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "api.app:app",
+        "--host", "0.0.0.0",
+        "--port", "8080",
+        "--workers", "1"
+        // 除錯時「不要」加 --reload：reloader 會另開子行程，導致中斷點打不到
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      // 載入 .env（DB 連線、IdentityServer、API 設定都在裡面）
+      "envFile": "${workspaceFolder}/.env",
+      // 讓你可以 step into el / dlt 的程式碼（設 true 則只停在自己的程式碼）
+      "justMyCode": false,
+      // 指定 conda dbt-env 直譯器（dlt 等套件只裝在此環境）。
+      // 若你已在 VSCode 右下角選好 dbt-env，可改成 "${command:python.interpreterPath}"
+      "python": "C:/Users/GP5140/AppData/Local/miniforge3/envs/dbt-env/python.exe"
+      //"python": "${command:python.interpreterPath}"
+    }
+  ]
+}

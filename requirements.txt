@@ -101,3 +101,8 @@ wheel==0.45.1
 win-precise-time==1.4.2
 zipp==3.23.0
 zstandard==0.25.0
+
+# --- REST API (api/ package; only needed to run the API server) ---
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+httpx==0.28.1
