@@ -36,12 +36,19 @@ def delete_batch_tree(pipeline, root: Node, batch_column: str, value: Any) -> di
     identify which descendant rows to remove. Returns {node.path: deleted_count}.
 
     Drift guard: if a node's physical table is not found but dlt's schema says it
-    should exist, we raise (rather than silently skip) — this is the LOUD failure
-    that catches a dlt naming change on upgrade. See el/ch_internal.py.
+    should exist AND the destination has actually been loaded into before, we raise
+    (rather than silently skip) — this LOUD failure catches a dlt naming change on
+    upgrade. On a fresh destination (never loaded by dlt) every missing table is a
+    genuine first load, so the guard is skipped. See el/ch_internal.py.
     """
     counts: dict[str, int] = {}
 
     with open_ch_namer(pipeline) as namer:
+        # Has dlt ever loaded into THIS destination? (`_dlt_loads` is created on the
+        # first load.) The drift guard only applies when it has — otherwise dlt's
+        # local schema may be stale from a previous/other destination and would
+        # falsely flag every table on a brand-new database.
+        destination_initialized = namer.exists("_dlt_loads")
 
         def membership_ch(node: Node) -> str:
             if node.parent is None:
@@ -54,7 +61,7 @@ def delete_batch_tree(pipeline, root: Node, batch_column: str, value: Any) -> di
 
         for node in iter_postorder(root):
             if not namer.exists(node.table_name):
-                if dlt_knows_table(pipeline, node.table_name):
+                if destination_initialized and dlt_knows_table(pipeline, node.table_name):
                     db, phys = namer.physical_path(node.table_name)
                     raise RuntimeError(
                         f"Pre-delete target for '{node.table_name}' not found in ClickHouse as "
