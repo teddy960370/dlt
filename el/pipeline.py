@@ -9,7 +9,7 @@ from typing import Optional, Sequence
 import dlt
 
 from el.batch import delete_batch_tree, fetch_latest_batch_value
-from el.ch_internal import normalized_table_name, row_counts_for, sync_schema_from_destination
+from el.ch_internal import normalized_table_name, row_counts_for
 from el.connections import (
     build_clickhouse_destination,
     build_source_engine,
@@ -75,9 +75,6 @@ def run_source(
         # Empty dataset -> tables stored directly as <target_schema>.<table>, no prefix.
         dataset_name="",
     )
-    # Restore dlt's schema from ClickHouse so the pre-delete drift guard can tell a
-    # first load apart from a naming mismatch (see el/ch_internal.py, el/batch.py).
-    sync_schema_from_destination(pipeline)
     log.info("[%s] target ClickHouse database = %s", source_name, source.target_schema)
 
     tables = list(source.tables)

@@ -13,7 +13,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from el.ch_internal import ch_literal, dlt_knows_table, open_ch_namer
+from el.ch_internal import ch_literal, open_ch_namer
 from el.source import Node, iter_postorder
 
 
@@ -35,20 +35,16 @@ def delete_batch_tree(pipeline, root: Node, batch_column: str, value: Any) -> di
     Children are deleted before parents so ancestor rows are still present to
     identify which descendant rows to remove. Returns {node.path: deleted_count}.
 
-    Drift guard: if a node's physical table is not found but dlt's schema says it
-    should exist AND the destination has actually been loaded into before, we raise
-    (rather than silently skip) — this LOUD failure catches a dlt naming change on
-    upgrade. On a fresh destination (never loaded by dlt) every missing table is a
-    genuine first load, so the guard is skipped. See el/ch_internal.py.
+    If a node's physical table does not exist yet, there is nothing to pre-delete
+    and we skip it (count 0). Physical absence is a normal, expected state here — a
+    genuine first load, or a table that has always had 0 rows for the chosen batch
+    (dlt does not create empty tables) — so it is NOT treated as an error. The
+    pre-delete uses dlt's own naming functions (see el/ch_internal.py), so the
+    delete target and dlt's write target stay aligned by construction.
     """
     counts: dict[str, int] = {}
 
     with open_ch_namer(pipeline) as namer:
-        # Has dlt ever loaded into THIS destination? (`_dlt_loads` is created on the
-        # first load.) The drift guard only applies when it has — otherwise dlt's
-        # local schema may be stale from a previous/other destination and would
-        # falsely flag every table on a brand-new database.
-        destination_initialized = namer.exists("_dlt_loads")
 
         def membership_ch(node: Node) -> str:
             if node.parent is None:
@@ -61,16 +57,7 @@ def delete_batch_tree(pipeline, root: Node, batch_column: str, value: Any) -> di
 
         for node in iter_postorder(root):
             if not namer.exists(node.table_name):
-                if destination_initialized and dlt_knows_table(pipeline, node.table_name):
-                    db, phys = namer.physical_path(node.table_name)
-                    raise RuntimeError(
-                        f"Pre-delete target for '{node.table_name}' not found in ClickHouse as "
-                        f"'{db}.{phys}', but dlt's schema says this table exists. This usually "
-                        f"means dlt's table-naming changed (upgrade?) and the pre-delete would "
-                        f"silently miss the real table. Re-check el/ch_internal.py against this "
-                        f"dlt version."
-                    )
-                # genuine first load — dlt will create the table on load
+                # No physical table -> nothing to delete (first load, or 0-row table).
                 counts[node.path] = 0
                 continue
 

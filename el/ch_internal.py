@@ -14,7 +14,6 @@ dlt internals used here (NOT part of dlt's stable public API):
   - client.make_qualified_table_name()         (physical, quoted "<db>.<prefix><table>")
   - client.make_qualified_table_name_path()    (physical, unquoted [db, table])
   - client.execute_sql()
-  - pipeline.default_schema / default_schema_name / .tables   (what dlt has loaded)
   - pipeline.last_trace.last_extract_info / last_normalize_info  (row-count metrics)
 
 WHY we need them: dlt's ClickHouse destination stores tables as
@@ -28,12 +27,14 @@ FAILURE MODES on upgrade:
   * Naming *behaviour* changes                     -> write & delete change together
                                                       (still aligned), because both go
                                                       through these same functions.
-  * A subtle divergence in how the physical name is derived -> would be SILENT, so
-    `delete_batch_tree` calls `assert_table_known_or_absent()` to turn that into a
-    LOUD error (see el/batch.py).
 
-ON UPGRADE: run the naming-alignment canary (a real load + compare to
-system.tables), and if anything here breaks, fix it HERE and nowhere else.
+Note: the pre-delete treats a physically-missing table as "nothing to delete"
+(a genuine first load, or a table that has always had 0 rows for the batch — dlt
+does not create empty tables), NOT as an error. See el/batch.py.
+
+ON UPGRADE: if anything here breaks, fix it HERE and nowhere else. To sanity-check
+naming alignment, do a real load and confirm the tables appear in system.tables
+under the names these helpers compute.
 ================================================================================
 """
 from __future__ import annotations
@@ -116,34 +117,6 @@ def open_ch_namer(pipeline) -> Iterator[ChTableNamer]:
     naming = pipeline.naming
     with pipeline.sql_client() as client:
         yield ChTableNamer(client, naming)
-
-
-# --- "Does dlt already know this table" (drift detection support) ----------- #
-
-def dlt_knows_table(pipeline, source_table: str) -> bool:
-    """True if dlt's restored schema already contains this table.
-
-    Used to tell a legitimate first-load (table genuinely absent -> skip delete)
-    apart from naming drift (dlt expects the table, but our computed physical name
-    is not found -> raise). Call `pipeline.sync_destination()` beforehand so the
-    schema reflects what is actually in ClickHouse.
-    """
-    if not pipeline.default_schema_name:
-        return False
-    norm = pipeline.naming.normalize_table_identifier(source_table)
-    return norm in pipeline.default_schema.tables
-
-
-def sync_schema_from_destination(pipeline) -> None:
-    """Restore dlt's schema/state from ClickHouse so dlt_knows_table is reliable.
-
-    No-op-safe on a brand-new dataset (nothing to restore).
-    """
-    try:
-        pipeline.sync_destination()
-    except Exception:
-        # Fresh dataset / nothing to restore yet — fine.
-        pass
 
 
 # --- Row-count metrics from the last run's trace (DLT-INTERNAL) ------------- #

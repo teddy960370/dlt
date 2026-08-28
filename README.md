@@ -79,8 +79,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     A["python -m el.run --source X<br/>(--batch-value / --tables)"] --> B["建立目的 database<br/>CREATE DATABASE IF NOT EXISTS"]
-    B --> C["還原 dlt schema<br/>(供命名漂移守衛判斷)"]
-    C --> D{"每張表的 mode?"}
+    B --> D{"每張表的 mode?"}
     D -->|full_replace| E["dlt replace<br/>TRUNCATE + 全量寫入"]
     D -->|scd2| F["dlt merge/scd2<br/>維護 valid_from/to"]
     D -->|batch| G["解析批次值<br/>CLI 或 MAX(batch_column)"]
@@ -106,7 +105,7 @@ dlt/
 │   ├── settings.py       # 讀 .env + sources.yml，輸出設定物件
 │   ├── connections.py    # 組 MSSQL/Oracle 連線、ClickHouse destination
 │   ├── source.py         # 依 mode 建立 dlt resource（含子表遞迴過濾）
-│   ├── batch.py          # batch 值解析、ClickHouse 預刪除（後序、含漂移守衛）
+│   ├── batch.py          # batch 值解析、ClickHouse 預刪除（後序：孫→子→父）
 │   ├── ch_internal.py    # ⚠ dlt 內部 API 的唯一集中處（升版重點檢查）
 │   ├── pipeline.py       # 編排：建庫 → 預刪除 → 載入 → 記數
 │   └── run.py            # CLI 進入點
@@ -385,7 +384,7 @@ GRANT SELECT, INSERT, ALTER, TRUNCATE, CREATE TABLE, DROP TABLE ON raw_test.* TO
 | `DPI-1050: Oracle Client library is at version 12.2 but version 19.1 or higher is needed` | 用到 oracledb 4.x。降版：`pip install "oracledb==2.5.1"`。 |
 | `Not enough privileges ... INFORMATION_SCHEMA.COLUMNS` | ClickHouse 帳號缺權限，見 [ClickHouse 權限](#clickhouse-權限)。 |
 | `Not enough privileges ... TRUNCATE ON ...` | full_replace 需 `TRUNCATE`：`GRANT TRUNCATE ON <schema>.* TO <user>;` |
-| `RuntimeError: Pre-delete target ... not found ... but dlt's schema says this table exists` | 命名漂移守衛觸發（多半是 dlt 升版改了命名）。檢查 `el/ch_internal.py`。 |
+| batch 子表 `select=0`／某批次沒有子資料 | 正常現象：該 `--batch-value`（或 `MAX` 抓到的最新 edition）在來源沒有對應子列。換一個有明細的批次值即可；子表 0 筆時 dlt 不會建表，屬預期。 |
 | batch 表「有結構、沒資料」（select=0） | 批次值與資料不符：確認 `batch_column` 名稱與帶入的 `--batch-value`（或 `MAX` 抓到的值）確實存在。 |
 
 ---
@@ -396,8 +395,9 @@ GRANT SELECT, INSERT, ALTER, TRUNCATE, CREATE TABLE, DROP TABLE ON raw_test.* TO
 這些呼叫全部**集中在 [`el/ch_internal.py`](el/ch_internal.py)** 一個檔（檔頭有詳細警語）。
 
 - **升版 dlt 前**：重點檢查此檔。若 dlt 改了方法名/簽名，會**當場 `AttributeError/TypeError`**（好抓）。
-- **命名漂移守衛**：`el/batch.py` 的預刪除若發現「dlt 認為某表存在、但算出的實體名查不到」，會
-  **`raise RuntimeError`** 而非安靜略過——避免升版後悄悄把資料寫重複。
+- **命名對齊**：預刪除算實體表名用的是 **dlt 自己的命名函式**（`normalize_table_identifier` +
+  `make_qualified_table_name`），與 dlt 寫入同一套 → 升版若改命名，兩邊一起改、仍對齊。
+  預刪除若發現實體表不存在，代表「首次載入」或「該批次 0 筆（dlt 不建空表）」，屬正常，直接跳過不刪。
 - **未來方向（非必要）**：可把 ClickHouse 這層也改用 SQLAlchemy 操作（像 `source.py` 對來源那樣），
   更好測試／可換 DuckDB；但代價是要自行維護一套與 dlt 對齊的命名邏輯（換一種風險）。
 
